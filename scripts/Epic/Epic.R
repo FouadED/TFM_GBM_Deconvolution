@@ -139,7 +139,7 @@ print(p1)
 ggsave("figures/epic_proporciones_barras.png", p1, width = 10, height = 6, dpi = 300)
 
 # --- 8B. Comparación con MuSiC ---
-music_prop <- read.csv("../MuSiC/proporciones_estimadas_music.csv", row.names = 1)
+music_prop <- read.csv("../MuSiC/results/proporciones_estimadas_music.csv", row.names = 1)
 
 tipos_comunes <- intersect(
   colnames(result_epic$cellFractions),
@@ -179,3 +179,4 @@ for (tipo in tipos_comunes) {
 }
 
 cat("\n✓ Script EPIC completado\n")
+
