@@ -1,21 +1,36 @@
 ###############################################################################
-# DECONVOLUCIÓN EPIC - DATOS REALES OLIGODENDROGLIOMA
-# Con referencia scRNA-seq propia
+# 03_EPIC — Deconvolución celular con EPIC
+# Input:  seurat_processed.rds + bulk RNA-seq
+# Output: proporciones celulares por muestra
+# Genérico para cualquier Seurat procesado con cell_label
 ###############################################################################
-
-#devtools::install_github("GfellerLab/EPIC")
 
 library(EPIC)
 library(Seurat)
+library(Matrix)
 library(readxl)
 library(ggplot2)
 library(reshape2)
 
 # =============================================================================
+# CONFIGURACIÓN — Solo toca este bloque
+# =============================================================================
+
+config <- list(
+  seurat_path  = "data/seurat_processed.rds",
+  bulk_path    = "data/oligo_counts_protein.coding.xlsx",
+  cell_type_col = "cell_label",
+  music_csv    = "scripts/01_MuSiC/results/proporciones_estimadas_music.csv",
+  output_dir   = "scripts/03_EPIC/results",
+  figures_dir  = "scripts/03_EPIC/figures"
+)
+
+# =============================================================================
 # 1. CARGAR BULK RNA-SEQ
 # =============================================================================
 
-bulk_raw <- read_excel("../oligo_counts_protein.coding.xlsx")
+cat("Cargando bulk RNA-seq...\n")
+bulk_raw <- read_excel(config$bulk_path)
 
 gene_col <- colnames(bulk_raw)[1]
 bulk_mat <- as.matrix(bulk_raw[, -1])
@@ -26,7 +41,6 @@ cat("Dimensiones bulk:", nrow(bulk_mat), "genes x", ncol(bulk_mat), "muestras\n"
 
 # =============================================================================
 # 2. NORMALIZAR A TPM
-# EPIC necesita TPM, no raw counts
 # =============================================================================
 
 counts_to_tpm <- function(counts) {
@@ -36,40 +50,44 @@ counts_to_tpm <- function(counts) {
 }
 
 bulk_tpm <- counts_to_tpm(bulk_mat)
-
 cat("Suma por muestra (debe ser ~1e6):\n")
-print(round(colSums(bulk_tpm)))
+print(round(colSums(bulk_tpm)[1:5]))
 
 # =============================================================================
-# 3. CONSTRUIR REFERENCIA SEURAT
+# 3. CONSTRUIR REFERENCIA DESDE SEURAT PROCESADO
+# Usa cell_label — incluye subtipos
 # =============================================================================
 
-seurat_obj  <- readRDS("../seurat_oligodendroglioma_RAW.rds")
-seurat_filt <- subset(seurat_obj, subset = Assignment != "BCells")
+cat("\nCargando Seurat procesado...\n")
+seurat_filt <- readRDS(config$seurat_path)
 
-cat("\nDistribución de tipos celulares:\n")
-print(table(seurat_filt@meta.data$Assignment))
+cat("Tipos celulares en referencia:\n")
+print(table(seurat_filt@meta.data[[config$cell_type_col]]))
 
-# Calcular perfil medio de expresión por tipo celular
-sc_counts  <- GetAssayData(seurat_filt, layer = "counts", assay = "RNA")
-cell_types <- seurat_filt@meta.data$Assignment
-tipos      <- unique(cell_types)
+# Extraer counts como sparse y reconstruir counts crudos
+lib_size  <- as.numeric(seurat_filt@meta.data$nCount_RNA)
+sc_sparse <- GetAssayData(seurat_filt, layer = "counts", assay = "RNA")
+sc_sparse@x <- expm1(sc_sparse@x)
+sc_sparse_raw <- sc_sparse %*% Matrix::Diagonal(x = lib_size / 10000)
+sc_sparse_raw@x <- round(sc_sparse_raw@x)
+
+# Calcular perfil medio por tipo celular
+cell_types   <- seurat_filt@meta.data[[config$cell_type_col]]
+tipos        <- unique(cell_types)
 
 ref_profiles <- sapply(tipos, function(tipo) {
   idx <- which(cell_types == tipo)
-  rowMeans(sc_counts[, idx])
+  Matrix::rowMeans(sc_sparse_raw[, idx])
 })
 
-# ref_profiles: genes x tipos celulares
 cat("\nDimensiones referencia:", nrow(ref_profiles), "genes x", ncol(ref_profiles), "tipos\n")
-cat("Tipos celulares en referencia:", colnames(ref_profiles), "\n")
 
 # =============================================================================
-# 4. ALINEAR GENES ENTRE REFERENCIA Y BULK
+# 4. ALINEAR GENES
 # =============================================================================
 
 genes_comunes <- intersect(rownames(ref_profiles), rownames(bulk_tpm))
-cat("\nGenes compartidos referencia-bulk:", length(genes_comunes), "\n")
+cat("Genes compartidos referencia-bulk:", length(genes_comunes), "\n")
 
 if (length(genes_comunes) < 1000) {
   warning("Menos de 1000 genes comunes — revisa nomenclatura ENSEMBL vs SYMBOL")
@@ -87,11 +105,16 @@ mi_referencia <- list(
   sigGenes    = rownames(ref_profiles_filt)
 )
 
+cat("\nEjecutando EPIC...\n")
+cat("Hora de inicio:", format(Sys.time(), "%H:%M:%S"), "\n")
+
 result_epic <- EPIC(
   bulk           = bulk_tpm_filt,
   reference      = mi_referencia,
   withOtherCells = TRUE
 )
+
+cat("Hora de fin:", format(Sys.time(), "%H:%M:%S"), "\n")
 
 # =============================================================================
 # 6. EXTRAER PROPORCIONES
@@ -102,22 +125,23 @@ prop_epic$sample <- rownames(prop_epic)
 prop_epic        <- prop_epic[, c("sample", setdiff(colnames(prop_epic), "sample"))]
 
 cat("\nProporciones estimadas EPIC:\n")
-print(round(result_epic$cellFractions, 3))
+print(round(head(result_epic$cellFractions), 3))
 
 # =============================================================================
 # 7. GUARDAR RESULTADOS
 # =============================================================================
 
-dir.create("results", showWarnings = FALSE)
-dir.create("figures", showWarnings = FALSE)
+dir.create(config$output_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(config$figures_dir, showWarnings = FALSE, recursive = TRUE)
 
-write.csv(prop_epic, "results/epic_proportions.csv", row.names = FALSE)
+write.csv(prop_epic,
+          file.path(config$output_dir, "epic_proportions.csv"),
+          row.names = FALSE)
 
 # =============================================================================
 # 8. GRÁFICOS
 # =============================================================================
 
-# --- 8A. Barras apiladas ---
 prop_long <- melt(prop_epic,
                   id.vars       = "sample",
                   variable.name = "cell_type",
@@ -133,49 +157,45 @@ p1 <- ggplot(prop_long, aes(x = sample, y = proportion, fill = cell_type)) +
     fill  = "Tipo celular"
   ) +
   theme_classic() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6))
 
 print(p1)
-ggsave("figures/epic_proporciones_barras.png", p1, width = 10, height = 6, dpi = 300)
+ggsave(file.path(config$figures_dir, "epic_proporciones_barras.png"),
+       p1, width = 14, height = 6, dpi = 300)
 
-# --- 8B. Comparación con MuSiC ---
-music_prop <- read.csv("../MuSiC/results/proporciones_estimadas_music.csv", row.names = 1)
-
-tipos_comunes <- intersect(
-  colnames(result_epic$cellFractions),
-  colnames(music_prop)
-)
-cat("\nTipos celulares comunes MuSiC vs EPIC:", tipos_comunes, "\n")
-
-muestras_comunes <- intersect(
-  rownames(result_epic$cellFractions),
-  rownames(music_prop)
-)
-
-for (tipo in tipos_comunes) {
+# --- Comparación con MuSiC ---
+if (file.exists(config$music_csv)) {
   
-  df_cor <- data.frame(
-    MuSiC  = music_prop[muestras_comunes, tipo],
-    EPIC   = result_epic$cellFractions[muestras_comunes, tipo],
-    sample = muestras_comunes
-  )
+  music_prop <- read.csv(config$music_csv, row.names = 1)
   
-  cor_val <- round(cor(df_cor$MuSiC, df_cor$EPIC, method = "spearman"), 3)
+  tipos_comunes    <- intersect(colnames(result_epic$cellFractions), colnames(music_prop))
+  muestras_comunes <- intersect(rownames(result_epic$cellFractions), rownames(music_prop))
   
-  p <- ggplot(df_cor, aes(x = MuSiC, y = EPIC, label = sample)) +
-    geom_point(size = 3, color = "#D7191C") +
-    geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.8) +
-    geom_text(vjust = -0.5, size = 2.5) +
-    labs(
-      title    = paste0("MuSiC vs EPIC — ", tipo),
-      subtitle = paste0("Spearman r = ", cor_val),
-      x        = "MuSiC proporción",
-      y        = "EPIC proporción"
-    ) +
-    theme_bw()
+  cat("\nTipos comunes MuSiC vs EPIC:", tipos_comunes, "\n")
   
-  ggsave(paste0("figures/correlacion_EPIC_", tipo, ".png"),
-         p, width = 6, height = 5, dpi = 300)
+  for (tipo in tipos_comunes) {
+    df_cor <- data.frame(
+      MuSiC  = music_prop[muestras_comunes, tipo],
+      EPIC   = result_epic$cellFractions[muestras_comunes, tipo],
+      sample = muestras_comunes
+    )
+    cor_val <- round(cor(df_cor$MuSiC, df_cor$EPIC, method = "spearman"), 3)
+    
+    p <- ggplot(df_cor, aes(x = MuSiC, y = EPIC, label = sample)) +
+      geom_point(size = 3, color = "#D7191C") +
+      geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.8) +
+      geom_text(vjust = -0.5, size = 2.5) +
+      labs(
+        title    = paste0("MuSiC vs EPIC — ", tipo),
+        subtitle = paste0("Spearman r = ", cor_val),
+        x        = "MuSiC proporción",
+        y        = "EPIC proporción"
+      ) +
+      theme_bw()
+    
+    ggsave(file.path(config$figures_dir, paste0("correlacion_EPIC_", tipo, ".png")),
+           p, width = 6, height = 5, dpi = 300)
+  }
 }
 
 cat("\n✓ Script EPIC completado\n")
