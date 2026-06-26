@@ -1,7 +1,0 @@
-"tipo","metodo","spearman","validado"
-"Myeloid","xCell",0.725,"✓ OK"
-"Myeloid","MCP-counter",0.395,"⚠ REVISAR"
-"TCells","xCell",-0.196,"⚠ REVISAR"
-"TCells","MCP-counter",0.017,"⚠ REVISAR"
-"Endo","xCell",0.617,"✓ OK"
-"Endo","MCP-counter",0.476,"⚠ REVISAR"
