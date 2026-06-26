@@ -1,113 +1,191 @@
-###############################################################################
-# DECONVOLUCIÓN MCP-counter - DATOS REALES OLIGODENDROGLIOMA
-###############################################################################
+# ==============================================================================
+# Immune/Stromal Scoring with MCP-counter (ROL2, supplementary)
+# ------------------------------------------------------------------------------
+# Project : Reproducible cell-type deconvolution pipeline for IDH-mutant
+#           1p/19q-codeleted oligodendroglioma (bulk RNA-seq)
+# Script  : 05_MCP_Counter
+# Author  : Fouad Eddaoudi Lakraichi
+# ------------------------------------------------------------------------------
+# PURPOSE
+#   Compute abundance scores for immune and stromal populations in the bulk
+#   cohort using MCP-counter. This is a reference-free (ROL2) method used only
+#   for SUPPLEMENTARY, directional validation; its scores are arbitrary
+#   abundance estimates (NOT proportions) and are not combined with the ROL1
+#   consensus. MCP-counter uses its own internal marker panel, so it does not
+#   depend on the LGG-04 scRNA-seq reference.
+#
+# INPUT NORMALISATION
+#   Expression is TPM-normalised using raw counts and the EPIC gene-length
+#   cache (corrects per-gene length, unlike a constant-factor CPM).
+#
+# INPUTS
+#   data/bulk/oligo_counts_protein.coding.xlsx     (raw counts)
+#   scripts/03_EPIC/results/gene_lengths_cache.csv (gene lengths)
+#
+# OUTPUTS
+#   scripts/05_MCP_Counter/results/mcpcounter_scores.csv
+#   scripts/05_MCP_Counter/figures/*.png
+#
+# NOTE
+#   MCP-counter is installed from GitHub on first run (requires internet).
+#
+# REFERENCE
+#   Becht et al. (2016) MCP-counter. Genome Biol 17:218.
+# ==============================================================================
 
-devtools::install_github("ebecht/MCPcounter", 
-                         ref = "master", 
-                         subdir = "Source")
+set.seed(123)
 
-library(MCPcounter)
-library(readxl)
-library(ggplot2)
-library(reshape2)
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+COUNTS_PATH  <- "data/bulk/oligo_counts_protein.coding.xlsx"
+LENGTHS_PATH <- "scripts/03_EPIC/results/gene_lengths_cache.csv"
+OUT_DIR      <- "scripts/05_MCP_Counter/results"
+FIG_DIR      <- "scripts/05_MCP_Counter/figures"
 
-# =============================================================================
-# 1. CARGAR BULK RNA-SEQ
-# =============================================================================
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
 
-bulk_raw <- read_excel("../oligo_counts_protein.coding.xlsx")
+# ==============================================================================
+# DEPENDENCIES
+# ==============================================================================
+message("Loading libraries...")
+suppressPackageStartupMessages({
+  library(readxl)
+  library(ggplot2)
+  library(reshape2)
+})
 
-gene_col <- colnames(bulk_raw)[1]
-bulk_mat <- as.matrix(bulk_raw[, -1])
-rownames(bulk_mat) <- bulk_raw[[gene_col]]
-storage.mode(bulk_mat) <- "numeric"
+# Shared figure styling (theme only; MCP-counter cell types are not in the
+# cell-type palette, so a qualitative scale is used for fills).
+source("scripts/utils/tfm_theme.R")
 
-cat("Dimensiones bulk:", nrow(bulk_mat), "genes x", ncol(bulk_mat), "muestras\n")
+# ==============================================================================
+# 1. INSTALL MCP-counter (first run only; requires internet)
+# ==============================================================================
+message("\n[1/5] Checking MCP-counter installation...")
+if (!requireNamespace("MCPcounter", quietly = TRUE)) {
+  message("  MCPcounter not found. Installing from GitHub...")
+  if (!requireNamespace("devtools", quietly = TRUE)) {
+    install.packages("devtools", repos = "https://cloud.r-project.org",
+                     quiet = TRUE)
+  }
+  tryCatch(
+    devtools::install_github("ebecht/MCPcounter", ref = "master",
+                             subdir = "Source", upgrade = "never"),
+    error = function(e) {
+      stop("MCPcounter installation failed: ", conditionMessage(e),
+           call. = FALSE)
+    }
+  )
+}
+suppressPackageStartupMessages(library(MCPcounter))
+message("  MCP-counter ready.")
 
-# =============================================================================
-# 2. NORMALIZAR A TPM
-# MCP-counter necesita TPM, no raw counts
-# =============================================================================
-
-counts_to_tpm <- function(counts) {
-  rpk <- counts / 1000
-  tpm <- t(t(rpk) / colSums(rpk) * 1e6)
-  return(tpm)
+# ==============================================================================
+# HELPER: TPM from raw counts and gene lengths
+# ==============================================================================
+compute_tpm <- function(counts, gene_lengths_bp) {
+  shared   <- intersect(rownames(counts), names(gene_lengths_bp))
+  counts_f <- counts[shared, , drop = FALSE]
+  rpk      <- counts_f / gene_lengths_bp[shared]
+  t(t(rpk) / colSums(rpk) * 1e6)
 }
 
-bulk_tpm <- counts_to_tpm(bulk_mat)
+# ==============================================================================
+# 2. LOAD BULK AND NORMALISE TO TPM
+# ==============================================================================
+message("\n[2/5] Loading bulk and normalising to TPM...")
+if (!file.exists(LENGTHS_PATH)) stop("Missing gene length cache: ", LENGTHS_PATH)
 
-cat("Suma por muestra (debe ser ~1e6):\n")
-print(round(colSums(bulk_tpm)))
+raw <- read_excel(COUNTS_PATH, sheet = 1)
+counts <- as.matrix(raw[, -1])
+rownames(counts) <- raw[[1]]
+mode(counts) <- "numeric"
+counts[is.na(counts)] <- 0
+message(sprintf("  Bulk: %d genes x %d samples", nrow(counts), ncol(counts)))
 
-# =============================================================================
-# 3. DECONVOLUCIÓN CON MCP-counter
-# No necesita referencia scRNA-seq propia
-# Devuelve scores de abundancia, NO proporciones
-# =============================================================================
+gl <- read.csv(LENGTHS_PATH, stringsAsFactors = FALSE)
+names(gl)[1:2] <- c("gene", "length")
+gl <- gl[gl$length > 0, ]
+gene_lengths <- setNames(gl$length, gl$gene)
 
+bulk_tpm <- compute_tpm(counts, gene_lengths)
+col_sums <- colSums(bulk_tpm)
+message(sprintf("  TPM: %d genes x %d samples | per-sample sums ~%.0f",
+                nrow(bulk_tpm), ncol(bulk_tpm), mean(col_sums)))
+
+# ==============================================================================
+# 3. RUN MCP-counter
+#   Returns abundance scores (cell types x samples), not proportions.
+# ==============================================================================
+message("\n[3/5] Running MCP-counter...")
 mcp_scores <- MCPcounter.estimate(
-  expression    = bulk_tpm,
-  featuresType  = "HUGO_symbols"  # nombres de gen en formato SYMBOL
+  expression   = bulk_tpm,
+  featuresType = "HUGO_symbols"
 )
+message(sprintf("  Estimated %d populations x %d samples",
+                nrow(mcp_scores), ncol(mcp_scores)))
 
-# mcp_scores es tipos_celulares x muestras
-cat("\nTipos celulares estimados:\n")
-print(rownames(mcp_scores))
-cat("\nScores estimados:\n")
-print(round(mcp_scores, 3))
+# ==============================================================================
+# 4. SAVE SCORES (samples in rows, consistent with the pipeline)
+# ==============================================================================
+message("\n[4/5] Saving scores...")
+scores_df <- as.data.frame(t(mcp_scores))
+scores_df <- cbind(sample = rownames(scores_df), scores_df)
 
-# =============================================================================
-# 4. GUARDAR RESULTADOS
-# =============================================================================
+out_csv <- file.path(OUT_DIR, "mcpcounter_scores.csv")
+write.csv(scores_df, out_csv, row.names = FALSE)
+message(sprintf("  Written: %s (%d samples x %d populations)",
+                out_csv, nrow(scores_df), ncol(scores_df) - 1))
 
-dir.create("results", showWarnings = FALSE)
-dir.create("figures", showWarnings = FALSE)
+# ==============================================================================
+# 5. FIGURES
+# ==============================================================================
+message("\n[5/5] Generating figures...")
 
-mcp_df        <- as.data.frame(t(mcp_scores))
-mcp_df$sample <- rownames(mcp_df)
-mcp_df        <- mcp_df[, c("sample", setdiff(colnames(mcp_df), "sample"))]
+scores_long <- reshape2::melt(scores_df, id.vars = "sample",
+                              variable.name = "cell_type",
+                              value.name = "score")
 
-write.csv(mcp_df, "results/mcpcounter_scores.csv", row.names = FALSE)
-
-# =============================================================================
-# 5. GRÁFICOS
-# =============================================================================
-
-# --- 5A. Barras apiladas por muestra ---
-mcp_long <- melt(mcp_df,
-                 id.vars       = "sample",
-                 variable.name = "cell_type",
-                 value.name    = "score")
-
-p1 <- ggplot(mcp_long, aes(x = sample, y = score, fill = cell_type)) +
-  geom_bar(stat = "identity", width = 0.7) +
+# -- Figure 1: per-sample abundance scores ------------------------------------
+p_bar <- ggplot(scores_long, aes(x = sample, y = score, fill = cell_type)) +
+  geom_col(width = 0.8) +
+  scale_fill_brewer(palette = "Paired") +
   labs(
-    title = "Abundancia celular estimada (MCP-counter) — Oligodendroglioma",
-    x     = "Muestra bulk",
-    y     = "Score de abundancia",
-    fill  = "Tipo celular"
+    title    = "MCP-counter abundance scores (ROL2, supplementary)",
+    subtitle = "122 TCGA oligodendroglioma samples | TPM input",
+    x        = "Sample", y = "Abundance score", fill = "Population"
   ) +
-  theme_classic() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  theme_tfm()
 
-print(p1)
-ggsave("figures/mcpcounter_barras.png", p1, width = 14, height = 6, dpi = 300)
+ggsave(file.path(FIG_DIR, "mcpcounter_composition.png"),
+       p_bar, width = 14, height = 6, dpi = 300)
 
-# --- 5B. Boxplot por tipo celular ---
-p2 <- ggplot(mcp_long, aes(x = cell_type, y = score, fill = cell_type)) +
-  geom_boxplot(alpha = 0.7) +
-  geom_jitter(width = 0.2, alpha = 0.4, size = 1) +
+# -- Figure 2: score distribution per population ------------------------------
+p_box <- ggplot(scores_long, aes(x = cell_type, y = score, fill = cell_type)) +
+  geom_boxplot(alpha = 0.75, outlier.size = 0.6) +
+  scale_fill_brewer(palette = "Paired") +
   labs(
-    title = "Distribución de scores (MCP-counter) — Oligodendroglioma",
-    x     = "Tipo celular",
-    y     = "Score de abundancia"
+    title    = "MCP-counter score distribution (ROL2, supplementary)",
+    subtitle = "122 TCGA oligodendroglioma samples",
+    x        = "Population", y = "Abundance score"
   ) +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  guides(fill = "none")
+  theme_tfm(show_x_text = TRUE) +
+  theme(legend.position = "none")
 
-print(p2)
-ggsave("figures/mcpcounter_boxplot.png", p2, width = 10, height = 6, dpi = 300)
+ggsave(file.path(FIG_DIR, "mcpcounter_boxplot.png"),
+       p_box, width = 10, height = 6, dpi = 300)
 
-cat("\n✓ Script MCP-counter completado\n")
+message("  Figures written.")
+
+# ==============================================================================
+# SUMMARY
+# ==============================================================================
+message("\n", strrep("=", 70))
+message("  SCRIPT 05 (MCP-counter, ROL2 supplementary) COMPLETED")
+message(strrep("=", 70))
+message(sprintf("  Populations : %d", nrow(mcp_scores)))
+message(sprintf("  Samples     : %d", ncol(mcp_scores)))
+message(sprintf("  Output      : %s", out_csv))
+message(strrep("=", 70))
